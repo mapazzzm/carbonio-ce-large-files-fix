@@ -48,6 +48,18 @@ REAPER_INTERVAL_SECONDS = 600
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
+# Defensive: strip CR/LF/NUL and cap length on header values we relay to Java.
+# aiohttp's parser would normally reject CRLF in incoming headers, but we do
+# our own sanitisation so a malformed client (or future parser change) can't
+# inject extra headers via filename/parentid. Java has its own validation;
+# this is just belt-and-braces in our hop.
+_HEADER_BAD_RE = re.compile(r"[\r\n\x00]")
+_MAX_RELAY_HEADER_LEN = 1024
+
+
+def sanitize_relay_header(val: str) -> str:
+    return _HEADER_BAD_RE.sub("", val)[:_MAX_RELAY_HEADER_LEN]
+
 # Public-link download proxy ----------------------------------------------
 # Java BlobController streams blobs via OkHttp and crashes with EOFException
 # on large files (storages closes its idle TCP connection mid-stream). We
@@ -146,6 +158,10 @@ async def forward_to_java(headers: dict, files: list[Path]) -> tuple[int, str, s
     }
     for key in ("Cookie", "filename", "parentid", "X-ZM-AUTH"):
         if val := headers.get(key):
+            if key in ("filename", "parentid"):
+                val = sanitize_relay_header(val)
+                if not val:
+                    continue
             fwd_headers[key] = val
 
     timeout = ClientTimeout(total=JAVA_TIMEOUT_SECONDS, sock_connect=10)
