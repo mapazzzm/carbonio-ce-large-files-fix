@@ -46,6 +46,12 @@ HTTP_READ_BUF = 256 * 1024        # 256 KiB while streaming the body in
 SESSION_TTL_SECONDS = 24 * 3600
 REAPER_INTERVAL_SECONDS = 600
 
+# Orphan DB nodes: Java creates a node row before writing the revision/blob.
+# If the upload is interrupted (page refresh, browser close, network drop),
+# the node stays in the DB with size=0 and no revision row — causing the
+# "this version cannot be found" error in the Files UI. Clean up after 1 hour.
+ORPHAN_DB_TTL_SECONDS = 3600
+
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 # Defensive: strip CR/LF/NUL and cap length on header values we relay to Java.
@@ -523,9 +529,10 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def _reap_once() -> None:
-    """Drop in-memory entries for sessions older than SESSION_TTL_SECONDS, and
-    sweep orphan dirs in CHUNK_DIR whose mtime is older than the same threshold.
-    Errors during sweeping are logged but never propagate.
+    """Drop in-memory entries for sessions older than SESSION_TTL_SECONDS, sweep
+    orphan chunk dirs on disk, and delete orphan DB nodes left by interrupted
+    direct (non-chunked) uploads. Errors during sweeping are logged but never
+    propagate.
     """
     threshold = time.time() - SESSION_TTL_SECONDS
     # 1. In-memory bookkeeping: drop entries whose staging dir is gone or stale.
@@ -556,6 +563,28 @@ async def _reap_once() -> None:
                     log.info("reaper: removed orphan dir %s", sid)
             except OSError:
                 pass
+    # 3. Orphan DB nodes: Java creates a node row before writing the revision/blob.
+    #    If a direct upload (<200 MB, bypasses this sidecar) is interrupted, the node
+    #    stays with size=0 and no revision row, causing "version not found" in the UI.
+    #    Delete such nodes after ORPHAN_DB_TTL_SECONDS (1 hour).
+    try:
+        pool = await get_db_pool()
+        orphan_threshold_ms = int((time.time() - ORPHAN_DB_TTL_SECONDS) * 1000)
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM node
+                WHERE current_version IS NOT NULL
+                  AND size = 0
+                  AND updated_timestamp < $1
+                  AND node_id NOT IN (SELECT DISTINCT node_id FROM revision)
+                """,
+                orphan_threshold_ms,
+            )
+        if result != "DELETE 0":
+            log.info("reaper: cleaned orphan DB nodes: %s", result)
+    except Exception as exc:
+        log.warning("reaper: orphan DB cleanup failed: %s", exc)
 
 
 async def _reaper_loop(app: web.Application) -> None:

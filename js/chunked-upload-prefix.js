@@ -1,4 +1,4 @@
-/* Carbonio Files chunked-upload monkey-patch (v50).
+/* Carbonio Files chunked-upload monkey-patch (v51).
  *
  * Interception points (per-target, not global — global window.XMLHttpRequest
  * patching breaks Carbonio's "Open Trash" snackbar):
@@ -465,8 +465,8 @@
     // doesn't know about and rejects with "Field 'getUploadItem' in type
     // 'Query' is undefined". Three belt-and-braces evictions per client:
     //   (a) ROOT_QUERY.getNode({"node_id":parentId}) — the query result entry
-    //   (b) Folder:<parentId> — the normalised entity (its `children` field)
-    //   (c) cache.modify DELETE for any storeFieldName variant we missed
+    //   (b) cache.modify DELETE for any storeFieldName variant we missed
+    // NOTE: evicting Folder:<parentId> entity caused 'can_write_file' crash — removed.
     // Apollo's observers will refetch on the next render, and only the real
     // server query (`getNode`) goes over the wire.
     if (!parentId) return;
@@ -479,7 +479,6 @@
         try {
           if (typeof c.cache.evict === 'function') {
             c.cache.evict({ id: 'ROOT_QUERY', fieldName: 'getNode', args: { node_id: parentId } });
-            c.cache.evict({ id: 'Folder:' + parentId });
           }
           if (typeof c.cache.modify === 'function') {
             c.cache.modify({
