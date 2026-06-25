@@ -19,14 +19,26 @@ import zipfile, os, shutil, sys, time
 JAR = "/usr/share/carbonio/carbonio-files.jar"
 CLASS_PATH = "com/zextras/carbonio/files/rest/services/BlobService.class"
 PATTERN = bytes.fromhex("B601939A")  # invokevirtual #403 verifyBlobExists + ifne
+PATCHED = bytes.fromhex("B601939C")  # ...same site after ifne→ifge
 
 # install.sh creates its own backup before invoking this patch. Standalone
 # users can opt in to a local backup by setting CU_BACKUP=1.
 LOCAL_BACKUP = os.environ.get("CU_BACKUP") == "1"
 
+def is_patched() -> bool:
+    """True iff both verifyBlobExists sites already use ifge (0x9C)."""
+    with zipfile.ZipFile(JAR, "r") as z:
+        bs = bytearray(z.read(CLASS_PATH))
+    return bs.count(PATTERN) == 0 and bs.count(PATCHED) >= 2
+
+
 def main():
     if not os.path.exists(JAR):
         sys.exit(f"JAR not found: {JAR}")
+    if "--check" in sys.argv:
+        # Exit 0 if already patched, 1 otherwise. install.sh uses this to decide
+        # whether the current JAR is vanilla and worth backing up.
+        sys.exit(0 if is_patched() else 1)
     if LOCAL_BACKUP:
         bak = f"/root/backups/carbonio-files/{time.strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(bak, exist_ok=True)
@@ -40,12 +52,10 @@ def main():
     while True:
         i = bs.find(PATTERN, p)
         if i < 0: break
-        if bs[i+3] == 0x9C:
-            print(f"  offset {i}: already patched")
-        else:
-            bs[i+3] = 0x9C
-            n += 1
-            print(f"  offset {i}: 9A → 9C (ifne → ifge)")
+        # PATTERN ends in 0x9A (ifne); finding it means this site is unpatched.
+        bs[i+3] = 0x9C
+        n += 1
+        print(f"  offset {i}: 9A → 9C (ifne → ifge)")
         p = i + 1
     if n == 0:
         print("Nothing to patch (already done or version differs).")

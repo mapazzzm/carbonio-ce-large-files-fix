@@ -66,15 +66,29 @@ msg "  готово" "  ok"
 # --- 3. JAR patch ---------------------------------------------------------
 msg "[3/8] JAR-патч (BlobService.verifyBlobExists, ifne→ifge)..." \
     "[3/8] JAR patch (BlobService verifyBlobExists, ifne→ifge)..."
-cp -a /usr/share/carbonio/carbonio-files.jar "$BAK/"
+# Back up only a vanilla JAR — otherwise a second install run would store an
+# already-patched JAR as the "backup" and uninstall could never revert.
+if ! python3 "$HERE/patches/blobservice_patch.py" --check; then
+  cp -a /usr/share/carbonio/carbonio-files.jar "$BAK/"
+fi
 python3 "$HERE/patches/blobservice_patch.py"
 msg "  готово" "  ok"
 
 # --- 4. Java heap bump ----------------------------------------------------
-msg "[4/8] Java heap: -Xmx4096m → -Xmx12288m..." "[4/8] Java heap: -Xmx4096m → -Xmx12288m..."
-cp -a /usr/bin/carbonio-files "$BAK/carbonio-files.wrapper"
-sed -i 's/-Xmx4096m/-Xmx12288m/' /usr/bin/carbonio-files
-msg "  готово" "  ok"
+# 8 GB max / 2 GB initial. The chunked-upload sidecar streams large files in
+# chunks from disk, so the Java process never needs to hold a whole file in
+# heap — 8 GB is plenty. Do NOT raise to 12 GB: under load (RSS grows well
+# past -Xmx with off-heap/native buffers) it pushed the box into the OOM-killer.
+# Only touch a vanilla wrapper (-Xmx4096m present) so a re-run never backs up
+# or re-rewrites an already-tuned file.
+msg "[4/8] Java heap: -Xmx → 8192m, -Xms → 2048m..." "[4/8] Java heap: -Xmx → 8192m, -Xms → 2048m..."
+if grep -q -- '-Xmx4096m' /usr/bin/carbonio-files; then
+  cp -a /usr/bin/carbonio-files "$BAK/carbonio-files.wrapper"
+  sed -i 's/-Xmx4096m/-Xmx8192m/; s/-Xms4096m/-Xms2048m/' /usr/bin/carbonio-files
+  msg "  готово" "  ok"
+else
+  msg "  heap уже настроен (нет -Xmx4096m) — пропускаю" "  heap already tuned (no -Xmx4096m) - skipping"
+fi
 
 # --- 5. Sidecar -----------------------------------------------------------
 msg "[5/8] Sidecar-сервис (carbonio-chunked-upload)..." \
@@ -133,8 +147,8 @@ sed "s/uploadView\\.0c7dbda7\\.chunk\\.js/$UPVIEW/g" "$HERE/js/chunked-upload-pr
   > "$CU_TMP"
 
 # 7a. files-ui 659.*.chunk.js
-cp -a "$CHUNK" "$BAK/"
 if ! grep -q "__cuPatched" "$CHUNK"; then
+  cp -a "$CHUNK" "$BAK/"
   # Bump Carbonio's UploadStore parallel-upload limit to 16. Different
   # Carbonio CE versions ship with different defaults (1, 3, ...), so we
   # match the structural pattern instead of a literal value. Small files
@@ -187,10 +201,10 @@ if [ -z "$MAILS_EV" ]; then
   msg "  ПРЕДУПРЕЖДЕНИЕ: mails-edit-view.*.chunk.js не найден в $MAILS_BASE — пропускаю mail-attach патч" \
       "  WARNING: mails-edit-view.*.chunk.js not found in $MAILS_BASE - skipping mail-attach patch" >&2
 else
-  cp -a "$MAILS_EV" "$BAK/"
   if grep -q "__cuPatched" "$MAILS_EV"; then
     msg "  mails-ui: уже пропатчен, пропускаю" "  mails-ui: already patched, skipping"
   else
+    cp -a "$MAILS_EV" "$BAK/"
     python3 - "$MAILS_EV" <<'PYEOF'
 import sys
 f = sys.argv[1]

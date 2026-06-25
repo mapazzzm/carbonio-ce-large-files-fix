@@ -44,7 +44,18 @@ HTTP_READ_BUF = 256 * 1024        # 256 KiB while streaming the body in
 # Reaper: drop session bookkeeping for sessions inactive longer than the TTL,
 # and sweep orphan dirs (e.g. left behind by a sidecar crash mid-upload).
 SESSION_TTL_SECONDS = 24 * 3600
+# Abandoned staging dirs (no matching in-memory entry — never finalised) are
+# swept far sooner so a flood of half-finished uploads can't sit on disk for a
+# full day. An active upload keeps the dir's mtime fresh, so this never touches
+# a transfer still in progress.
+ORPHAN_DIR_TTL_SECONDS = 6 * 3600
 REAPER_INTERVAL_SECONDS = 600
+
+# Cap concurrent staging dirs. The nginx gate only checks for the *presence* of
+# a ZM_AUTH_TOKEN cookie (real auth happens at the final POST to Java), so a
+# forged cookie could otherwise open unbounded sessions and fill the disk. This
+# bound is far above any legitimate concurrency; new sessions past it get 503.
+MAX_ACTIVE_SESSIONS = 256
 
 # Orphan DB nodes: Java creates a node row before writing the revision/blob.
 # If the upload is interrupted (page refresh, browser close, network drop),
@@ -213,6 +224,19 @@ async def handle_upload_chunked(request: web.Request) -> web.Response:
         return web.Response(status=status, text=body, content_type=ctype)
 
     d = session_dir(session_id)
+    if not d.exists():
+        # New session — enforce the global concurrency cap before creating a dir.
+        try:
+            active = sum(1 for _ in CHUNK_DIR.iterdir()) if CHUNK_DIR.exists() else 0
+        except OSError:
+            active = 0
+        if active >= MAX_ACTIVE_SESSIONS:
+            log.warning("rejecting new session %s: %d active sessions (cap %d)",
+                        session_id, active, MAX_ACTIVE_SESSIONS)
+            return web.json_response(
+                {"error": "too many active upload sessions, retry later"},
+                status=503,
+            )
     d.mkdir(parents=True, exist_ok=True)
 
     dest = d / f"{part:06d}.bin"
@@ -535,6 +559,7 @@ async def _reap_once() -> None:
     propagate.
     """
     threshold = time.time() - SESSION_TTL_SECONDS
+    orphan_dir_threshold = time.time() - ORPHAN_DIR_TTL_SECONDS
     # 1. In-memory bookkeeping: drop entries whose staging dir is gone or stale.
     for sid in list(session_results.keys()):
         d = session_dir(sid)
@@ -558,7 +583,7 @@ async def _reap_once() -> None:
             if sid in session_locks or sid in session_results:
                 continue
             try:
-                if d.stat().st_mtime < threshold:
+                if d.stat().st_mtime < orphan_dir_threshold:
                     cleanup_session(d)
                     log.info("reaper: removed orphan dir %s", sid)
             except OSError:

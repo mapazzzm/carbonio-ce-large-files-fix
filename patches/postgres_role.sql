@@ -11,3 +11,7 @@ GRANT USAGE ON SCHEMA public TO zextras;
 GRANT SELECT ON public.link TO zextras;
 GRANT SELECT ON public.node TO zextras;
 GRANT SELECT ON public.revision TO zextras;
+-- The reaper deletes orphan node rows left by interrupted direct uploads
+-- (size=0, current_version set, no revision row). Without DELETE the cleanup
+-- fails every interval with "permission denied for table node".
+GRANT DELETE ON public.node TO zextras;
