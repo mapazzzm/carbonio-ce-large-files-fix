@@ -369,6 +369,26 @@ _HOP_BY_HOP = frozenset({
 })
 
 
+async def java_access_validated(request: web.Request, token: str) -> bool:
+    """Cheap HEAD probe to Java (via envoy) forwarding the client's cookies, to
+    check whether an access-code session is validated. HEAD returns no body, so
+    it never streams the (possibly huge) blob. 200 → validated; a 307 to the
+    code-entry page / 404 / anything else → not (yet) validated."""
+    url = JAVA_PUBLIC_LINK_URL + "/" + token
+    if request.query_string:
+        url += "?" + request.query_string
+    fwd = {k: v for k, v in request.headers.items()
+           if k.lower() not in _HOP_BY_HOP and k.lower() not in ("host", "range")}
+    timeout = ClientTimeout(total=30, sock_connect=10)
+    try:
+        async with ClientSession(timeout=timeout, auto_decompress=False) as http:
+            async with http.head(url, headers=fwd, allow_redirects=False) as up:
+                return up.status == 200
+    except Exception as exc:
+        log.warning("access-code HEAD probe failed for token=%s: %s", token[:8], exc)
+        return False
+
+
 async def proxy_public_to_java(request: web.Request, token: str) -> web.StreamResponse:
     """Transparently reverse-proxy an access-code public link to the Java
     endpoint via envoy, streaming the response back verbatim (including a 307
@@ -429,13 +449,18 @@ async def handle_public_download(request: web.Request) -> web.StreamResponse:
     if row["expire_at"] and row["expire_at"] < int(time.time() * 1000):
         return web.json_response({"error": "link expired"}, status=410)
     if row["access_code"]:
-        # Access-code-protected links use Carbonio's Java flow: opening the link
-        # 307-redirects to the code-entry page, the code is validated into a
-        # session cookie, then the download proceeds. We can't replicate that, so
-        # transparently reverse-proxy the request to the Java public-link
-        # endpoint (via envoy), forwarding cookies/query/Range so a validated
-        # session is honoured, and stream the response (incl. the redirect) back.
-        return await proxy_public_to_java(request, token)
+        # Access-code-protected link. Carbonio validates the code on the
+        # code-entry page and marks the session with a cookie; the download
+        # request itself carries no code, only that cookie. So probe Java with a
+        # cheap HEAD (no body) forwarding the client's cookies: 200 means the
+        # session is validated → serve the blob via the fast sendfile path below
+        # (streaming the bytes through Java would hit its large-blob
+        # EOFException/OOM bug — the reason this sidecar exists). Anything else
+        # (307 to the code-entry page, 404) → reverse-proxy so the browser gets
+        # that response verbatim.
+        if not await java_access_validated(request, token):
+            return await proxy_public_to_java(request, token)
+        # Validated → fall through to the direct sendfile path.
 
     node_id = row["node_id"]
     version = row["current_version"]
