@@ -53,14 +53,19 @@ echo
 # --- 1. Python deps -------------------------------------------------------
 msg "[1/8] Python-зависимости (aiohttp, aiofiles, asyncpg)..." \
     "[1/8] Python deps (aiohttp, aiofiles, asyncpg)..."
+# --break-system-packages exists only on pip >= 23.0.1 (Ubuntu 24.04, PEP 668).
+# On 22.04 the flag is unknown, so fall back to a plain install.
 python3 -c "import aiohttp, aiofiles, asyncpg" 2>/dev/null || \
-  pip3 install --quiet --break-system-packages aiohttp aiofiles asyncpg
+  pip3 install --quiet --break-system-packages aiohttp aiofiles asyncpg 2>/dev/null || \
+  pip3 install --quiet aiohttp aiofiles asyncpg
 msg "  готово" "  ok"
 
 # --- 2. PostgreSQL role ---------------------------------------------------
 msg "[2/8] PostgreSQL: создание роли 'zextras' с read-only на link/node/revision..." \
     "[2/8] PostgreSQL: ensure 'zextras' role with read-only on link/node/revision..."
-sudo -u postgres psql -d "carbonio-files-db" -q -f "$HERE/patches/postgres_role.sql"
+# stdin redirect: the file is opened by root's shell, so the postgres user
+# never needs traverse access to the repo path (home dirs are 750 on noble).
+sudo -u postgres psql -d "carbonio-files-db" -q < "$HERE/patches/postgres_role.sql"
 msg "  готово" "  ok"
 
 # --- 3. JAR patch ---------------------------------------------------------
@@ -82,12 +87,26 @@ msg "  готово" "  ok"
 # Only touch a vanilla wrapper (-Xmx4096m present) so a re-run never backs up
 # or re-rewrites an already-tuned file.
 msg "[4/8] Java heap: -Xmx → 8192m, -Xms → 2048m..." "[4/8] Java heap: -Xmx → 8192m, -Xms → 2048m..."
-if grep -q -- '-Xmx4096m' /usr/bin/carbonio-files; then
+if [ -f /usr/bin/carbonio-files ] && grep -q -- '-Xmx4096m' /usr/bin/carbonio-files; then
+  # files-ce 1.1.x: java flags live in the /usr/bin/carbonio-files wrapper.
   cp -a /usr/bin/carbonio-files "$BAK/carbonio-files.wrapper"
   sed -i 's/-Xmx4096m/-Xmx8192m/; s/-Xms4096m/-Xms2048m/' /usr/bin/carbonio-files
-  msg "  готово" "  ok"
+  msg "  готово (wrapper)" "  ok (wrapper)"
+elif grep -q -- '-Xmx4096m' /usr/lib/systemd/system/carbonio-files.service 2>/dev/null \
+     && ! grep -qs -- '-Xmx8192m' /etc/systemd/system/carbonio-files.service.d/heap.conf; then
+  # files-ce 1.2.x: no wrapper, java is launched straight from the systemd
+  # unit. Override ExecStart via a drop-in so apt upgrades keep our heap.
+  mkdir -p /etc/systemd/system/carbonio-files.service.d
+  sed -n '/^ExecStart=/,/carbonio-files\.jar$/p' /usr/lib/systemd/system/carbonio-files.service \
+    | sed 's/-Xmx4096m/-Xmx8192m/; s/-Xms4096m/-Xms2048m/' \
+    > /tmp/cu_heap_execstart.$$
+  { echo "[Service]"; echo "ExecStart="; cat /tmp/cu_heap_execstart.$$; } \
+    > /etc/systemd/system/carbonio-files.service.d/heap.conf
+  rm -f /tmp/cu_heap_execstart.$$
+  systemctl daemon-reload
+  msg "  готово (systemd drop-in heap.conf)" "  ok (systemd drop-in heap.conf)"
 else
-  msg "  heap уже настроен (нет -Xmx4096m) — пропускаю" "  heap already tuned (no -Xmx4096m) - skipping"
+  msg "  heap уже настроен — пропускаю" "  heap already tuned - skipping"
 fi
 
 # --- 5. Sidecar -----------------------------------------------------------
@@ -135,8 +154,12 @@ msg "  готово" "  ok"
 msg "[7/8] JS-патчи (files-ui + shell-ui + mails-ui)..." \
     "[7/8] JS patches (files-ui + shell-ui + mails-ui)..."
 UI_BASE=$(ls -d /opt/zextras/web/iris/carbonio-files-ui/*/ 2>/dev/null | grep -v i18n | grep -v current | head -1)
-CHUNK=$(ls "${UI_BASE}659."*.chunk.js 2>/dev/null | grep -v '\.bak\.' | grep -v '\.map' | head -1)
-UPVIEW=$(ls "${UI_BASE}uploadView."*.chunk.js 2>/dev/null | grep -v '\.map' | head -1 | xargs -n1 basename)
+# files-ui 2.15.x ships the UploadStore in 659.*.chunk.js; 2.17.x moved it
+# into the main app.*.js bundle. Locate the file by content, not by name.
+# `|| true` guards: with pipefail a no-match grep/ls would silently kill the
+# whole script under set -e before the friendly error below.
+CHUNK=$(grep -ls "LIMIT:[0-9]" "${UI_BASE}"*.js 2>/dev/null | grep -v '\.map' | grep -v '\.bak\.' | head -1 || true)
+UPVIEW=$(ls "${UI_BASE}uploadView."*.chunk.js 2>/dev/null | grep -v '\.map' | head -1 | xargs -rn1 basename || true)
 if [ -z "$CHUNK" ] || [ -z "$UPVIEW" ]; then
   msg "  ОШИБКА: не найден 659.*.chunk.js или uploadView.*.chunk.js в $UI_BASE" \
       "  ERROR: cannot locate 659.*.chunk.js or uploadView.*.chunk.js in $UI_BASE" >&2
@@ -156,7 +179,9 @@ if ! grep -q "__cuPatched" "$CHUNK"; then
   # limits actual transfers, but progress events stay continuous instead
   # of jumping in batches). Medium/large plain uploads are additionally
   # gated to LargePlainConcurrency=5 in chunked-upload-prefix.js.
-  sed -i 's/return{LIMIT:[0-9]\+,/return{LIMIT:16,/g; s/(;n\.length<[0-9]\+&&e\.length>0/(;n.length<16\&\&e.length>0/g' "$CHUNK"
+  # "start next queued" gate: 2.15.x inlines it in a for-loop condition,
+  # 2.17.x extracts it into a predicate function. Cover both shapes.
+  sed -i 's/return{LIMIT:[0-9]\+,/return{LIMIT:16,/g; s/(;n\.length<[0-9]\+&&e\.length>0/(;n.length<16\&\&e.length>0/g; s/return n\.length<[0-9]\+&&e\.length>0/return n.length<16\&\&e.length>0/g' "$CHUNK"
   # Replace native XHR construction with our wrapper. The prefix exposes
   # window.__cuXHR; Carbonio's upload/version/action code uses `new XMLHttpRequest`
   # at 3-4 sites. Without this substitution the wrapper would be defined but
