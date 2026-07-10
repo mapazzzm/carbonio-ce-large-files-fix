@@ -25,6 +25,10 @@ from aiohttp import ClientSession, ClientTimeout, web
 # --- Config ---------------------------------------------------------------
 CHUNK_DIR = Path("/opt/zextras/chunked-upload-tmp")
 JAVA_UPLOAD_URL = "http://127.78.0.2:10000/upload"
+# Java public-link endpoint reached through envoy (same upstream nginx uses for
+# the normal /services/files/ path). Used to transparently delegate access-code
+# protected links, whose code-entry/redirect flow we don't replicate here.
+JAVA_PUBLIC_LINK_URL = "http://127.78.0.1:20000/public/link/download"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 5795
 
@@ -356,6 +360,45 @@ def quote_filename_for_header(name: str) -> str:
     return f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{quote(name)}'
 
 
+# Hop-by-hop headers that must not be forwarded across a proxy (RFC 7230 §6.1),
+# plus length/encoding which we let the streaming layer recompute.
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
+    "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+    "content-length",
+})
+
+
+async def proxy_public_to_java(request: web.Request, token: str) -> web.StreamResponse:
+    """Transparently reverse-proxy an access-code public link to the Java
+    endpoint via envoy, streaming the response back verbatim (including a 307
+    to the code-entry page). Cookies/Range/query are forwarded so the validated
+    access-code session is honoured and range/resume keeps working."""
+    url = JAVA_PUBLIC_LINK_URL + "/" + token
+    if request.query_string:
+        url += "?" + request.query_string
+    fwd = {k: v for k, v in request.headers.items()
+           if k.lower() not in _HOP_BY_HOP and k.lower() != "host"}
+    timeout = ClientTimeout(total=JAVA_TIMEOUT_SECONDS, sock_connect=10)
+    try:
+        async with ClientSession(timeout=timeout, auto_decompress=False) as http:
+            async with http.get(url, headers=fwd, allow_redirects=False) as up:
+                resp = web.StreamResponse(status=up.status)
+                for k, v in up.headers.items():
+                    if k.lower() not in _HOP_BY_HOP:
+                        resp.headers[k] = v
+                await resp.prepare(request)
+                async for chunk in up.content.iter_chunked(64 * 1024):
+                    await resp.write(chunk)
+                await resp.write_eof()
+                log.info("public-download access-code token=%s..%s -> java status=%s",
+                         token[:8], token[-8:], up.status)
+                return resp
+    except Exception as exc:
+        log.exception("access-code proxy failed for token=%s: %s", token[:8], exc)
+        return web.json_response({"error": "upstream error"}, status=502)
+
+
 async def handle_public_download(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token", "")
     if not PUBLIC_TOKEN_RE.match(token):
@@ -386,11 +429,13 @@ async def handle_public_download(request: web.Request) -> web.StreamResponse:
     if row["expire_at"] and row["expire_at"] < int(time.time() * 1000):
         return web.json_response({"error": "link expired"}, status=410)
     if row["access_code"]:
-        # We don't implement the access-code prompt here; let Java handle those.
-        # Caller can fall back to /services/files/public/link/access/{token}.
-        return web.json_response(
-            {"error": "access code required, use Java endpoint"}, status=401
-        )
+        # Access-code-protected links use Carbonio's Java flow: opening the link
+        # 307-redirects to the code-entry page, the code is validated into a
+        # session cookie, then the download proceeds. We can't replicate that, so
+        # transparently reverse-proxy the request to the Java public-link
+        # endpoint (via envoy), forwarding cookies/query/Range so a validated
+        # session is honoured, and stream the response (incl. the redirect) back.
+        return await proxy_public_to_java(request, token)
 
     node_id = row["node_id"]
     version = row["current_version"]
