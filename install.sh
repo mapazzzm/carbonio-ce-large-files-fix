@@ -45,9 +45,9 @@ need_pkg() {
   msg "  $pkg: $got (ожидается $expected)" "  $pkg: $got (expected $expected)"
 }
 msg "[0/8] Проверка версий пакетов:" "[0/8] Version check:"
-need_pkg carbonio-files-ce       1.1.2-1noble
-need_pkg carbonio-storages-ce    1.0.16-1ubuntu
-need_pkg carbonio-files-ui       2.15.2-1ubuntu
+need_pkg carbonio-files-ce       "1.1.x–1.2.x (CE 26.x)"
+need_pkg carbonio-storages-ce    "1.0.x"
+need_pkg carbonio-files-ui       "2.15.x–2.17.x (CE 26.x)"
 echo
 
 # --- 1. Python deps -------------------------------------------------------
@@ -124,24 +124,58 @@ systemctl restart carbonio-chunked-upload
 msg "  готово" "  ok"
 
 # --- 6. nginx templates ---------------------------------------------------
-msg "[6/8] nginx-шаблоны (вставка 6 location-блоков)..." \
-    "[6/8] nginx templates (insert 6 location blocks)..."
+msg "[6/8] nginx-шаблоны (синхронизация location-блоков)..." \
+    "[6/8] nginx templates (sync location blocks)..."
 TPL_DIR=/opt/zextras/conf/nginx/templates
 for t in nginx.conf.web.https.template nginx.conf.web.https.default.template; do
   cp -a "$TPL_DIR/$t" "$BAK/"
-  if ! grep -q "services/files/upload-chunked" "$TPL_DIR/$t"; then
-    python3 - "$TPL_DIR/$t" "$HERE/nginx/location-blocks.conf" <<'PYEOF'
-import sys
+  # Self-healing, per-block: parse location-blocks.conf into individual
+  # `location { ... }` units and insert only the ones the template is missing
+  # (matched by their directive line). Unlike a single all-or-nothing marker,
+  # this lets a re-run add newly-introduced blocks on top of an already-patched
+  # template — and stays idempotent when everything is present.
+  python3 - "$TPL_DIR/$t" "$HERE/nginx/location-blocks.conf" <<'PYEOF'
+import re, sys
 target, snippet = sys.argv[1], sys.argv[2]
-with open(target) as f: t = f.read()
-with open(snippet) as f: s = f.read()
-marker = "    location /services/files/"
-i = t.find(marker)
-if i < 0: sys.exit(f"marker not found in {target}")
-new = t[:i] + s.rstrip() + "\n\n" + t[i:]
-with open(target, "w") as f: f.write(new)
+tgt = open(target).read()
+snip = open(snippet).read().splitlines(keepends=True)
+
+# Parse the snippet into `location { ... }` blocks, each carrying the comment
+# lines immediately above it. A blank/code line breaks the comment association
+# so the file's header block never travels with a location.
+blocks, pending = [], []
+i, n = 0, len(snip)
+while i < n:
+    line = snip[i]
+    if re.match(r'\s*location\b', line):
+        body = pending + [line]; pending = []
+        depth = line.count('{') - line.count('}'); started = '{' in line
+        i += 1
+        while i < n and not (started and depth == 0):
+            l = snip[i]; body.append(l)
+            depth += l.count('{') - l.count('}'); started = started or '{' in l
+            i += 1
+        loc = next(x for x in body if re.match(r'\s*location\b', x))
+        sig = re.sub(r'\s*\{.*$', '', loc.strip())
+        blocks.append((sig, ''.join(body)))
+    else:
+        pending = pending + [line] if line.strip().startswith('#') else []
+        i += 1
+
+# Present if the directive is followed by '{' / newline / ';' — the trailing
+# guard avoids a prefix false-match ('/upload' vs '/upload-chunked').
+missing = [txt for sig, txt in blocks
+           if not re.search(re.escape(sig) + r'\s*(\{|\n|;)', tgt)]
+name = target.rsplit('/', 1)[-1]
+if missing:
+    marker = "    location /services/files/"
+    idx = tgt.find(marker)
+    if idx < 0: sys.exit(f"marker not found in {target}")
+    open(target, "w").write(tgt[:idx] + "".join(missing).rstrip() + "\n\n" + tgt[idx:])
+    print(f"  {name}: added {len(missing)} block(s)")
+else:
+    print(f"  {name}: all blocks present")
 PYEOF
-  fi
 done
 su - zextras -c "/opt/zextras/libexec/zmproxyconfgen" >/dev/null 2>&1
 su - zextras -c "/opt/zextras/common/sbin/nginx -t -c /opt/zextras/conf/nginx.conf" 2>&1 | tail -2
