@@ -18,6 +18,7 @@
 | Sidecar `envoy_files` имеет дефолтный `stream_idle_timeout=5min` в HCM | Медленные загрузки (слабый канал, паузы) получают `408` от envoy | **nginx-обход**: `/services/files/upload` идёт напрямую на Java `127.78.0.2:10000` |
 | Жёсткий 2 ГиБ-лимит (2³¹) на тело запроса у некоторых reverse-прокси | Загрузка зависает на ~2 ГиБ независимо от размера файла | **Chunked-upload sidecar + JS-патч**: браузер режет файлы >200 МБ на куски по 100 МБ; sidecar собирает и шлёт в Java |
 | `PublicBlobController` прокси через OkHttp с дефолтным read timeout; storages закрывает idle TCP в середине стрима → `EOFException` | Скачивание public-link файлов > ~3 ГБ падает с `500` | **Sidecar endpoint `public-download`**: ищет токен в `carbonio-files-db` через peer-auth, отдаёт blob через `sendfile()` (zero-copy, Range) |
+| Тот же баг на ZIP-эндпоинте `download-multiple`: Java собирает архив папки, читая каждый blob через OkHttp | «Скачать папку» по public-ссылке отдаёт обрезанный (~512 КиБ) битый ZIP, браузер ничего не сохраняет | **Sidecar endpoint `public-download-multiple`**: проверяет линк/код/поддерево в БД, стримит **ZIP64** (store, data-descriptor) прямо с диска — любой размер и число файлов |
 | Java heap `-Xmx4096m` слишком мал для стриминга больших блобов | OOM при UI-скачивании | **Heap bump** до 12 ГБ |
 | Smart-link mail attach использует `fetch()` (не XHR), не идёт через chunked | Большие вложения через "Загрузить как смарт-ссылку" упирается в 2 ГБ лимит reverse-прокси | **`window.__cuFetch`** перехватывает fetch в `mails-edit-view`, направляет в chunked |
 | Архитектурный шум: каждое Carbonio-приложение монтирует свой `PostHogProvider` | Console забит `[PostHog.js] posthog was already loaded elsewhere` | **Surgical patch** убирает именно эту строку warn в shell-ui |
@@ -30,7 +31,7 @@
 patches/blobservice_patch.py   – 2-байтный JAR-патч, идемпотентный, с бэкапом
 patches/postgres_role.sql      – Создаёт роль 'zextras' с read-only на link/node/revision
 patches/java_heap_bump.sh      – -Xmx4096m → -Xmx12288m в /usr/bin/carbonio-files
-sidecar/carbonio-chunked-upload.py        – Python aiohttp sidecar: chunked upload + public-link download
+sidecar/carbonio-chunked-upload.py        – Python aiohttp sidecar: chunked upload + public-link download + folder ZIP
 sidecar/carbonio-chunked-upload.service   – systemd unit (User=zextras)
 js/chunked-upload-prefix.js    – IIFE prepend к carbonio-files-ui 659.*.chunk.js и mails-edit-view.*.chunk.js
 nginx/location-blocks.conf     – 3 location-блока (через proxy_pass с URI, без rewrite) добавляются в оба шаблона nginx
@@ -147,6 +148,7 @@ Tested against `carbonio-files-ce 1.1.2` + `carbonio-storages-ce 1.0.16` (Carbon
 | `envoy_files` sidecar HCM has default `stream_idle_timeout=5min` | Slow uploads (low bandwidth, long pauses) get `408` from envoy | **nginx bypass**: route `/services/files/upload` direct to Java on `127.78.0.2:10000` |
 | Hard 2 GiB (`2³¹`) request-body limit in some reverse proxies | Upload stalls at ~2 GiB regardless of file size | **Chunked upload sidecar + JS patch**: browser splits >200 MB into 100 MB chunks; sidecar stitches them and POSTs to Java |
 | `PublicBlobController` proxies storages via OkHttp with default read timeout; storages closes idle TCP mid-stream → `EOFException` | Public-link download of files > ~3 GB fails with `500` | **Sidecar `public-download` endpoint**: looks up token in `carbonio-files-db` via peer-auth, sends blob with `sendfile()` (zero-copy, Range support) |
+| Same bug on the `download-multiple` ZIP endpoint: Java builds the folder archive by fetching each blob over OkHttp | "Download folder" on a public link returns a truncated (~512 KiB) broken ZIP; the browser saves nothing | **Sidecar `public-download-multiple` endpoint**: validates link/code/subtree in the DB, streams a **ZIP64** (store, data-descriptor) archive straight from disk — any size or file count |
 | Java heap `-Xmx4096m` undersized for streaming large blobs | OOM during UI download | **Heap bump** to 12 GB |
 | Smart-link mail attach uses `fetch()` (not XHR), bypasses chunked | Large attachments via "Convert to smart link" still hit the reverse-proxy 2 GB limit | **`window.__cuFetch`** intercepts the fetch in `mails-edit-view`, routes through chunked |
 | Architectural noise: each Carbonio app mounts its own `PostHogProvider` | Console spammed with `[PostHog.js] posthog was already loaded elsewhere` | **Surgical patch** removes just that warn line in shell-ui |
@@ -159,7 +161,7 @@ Each fix is independent and can be skipped (e.g. you don't need chunked upload i
 patches/blobservice_patch.py   – 2-byte JAR patch, idempotent, backs JAR up
 patches/postgres_role.sql      – Creates the 'zextras' DB role with read-only on link/node/revision
 patches/java_heap_bump.sh      – -Xmx4096m → -Xmx12288m in /usr/bin/carbonio-files
-sidecar/carbonio-chunked-upload.py        – Python aiohttp sidecar; handles chunked upload + public-link download
+sidecar/carbonio-chunked-upload.py        – Python aiohttp sidecar; handles chunked upload + public-link download + folder ZIP
 sidecar/carbonio-chunked-upload.service   – systemd unit (User=zextras)
 js/chunked-upload-prefix.js    – IIFE prepended to carbonio-files-ui 659.*.chunk.js and mails-edit-view.*.chunk.js
 nginx/location-blocks.conf     – 3 nginx location blocks (proxy_pass with URI, no rewrite) added to both templates

@@ -124,8 +124,8 @@ systemctl restart carbonio-chunked-upload
 msg "  готово" "  ok"
 
 # --- 6. nginx templates ---------------------------------------------------
-msg "[6/8] nginx-шаблоны (вставка 3 location-блоков)..." \
-    "[6/8] nginx templates (insert 3 location blocks)..."
+msg "[6/8] nginx-шаблоны (вставка 6 location-блоков)..." \
+    "[6/8] nginx templates (insert 6 location blocks)..."
 TPL_DIR=/opt/zextras/conf/nginx/templates
 for t in nginx.conf.web.https.template nginx.conf.web.https.default.template; do
   cp -a "$TPL_DIR/$t" "$BAK/"

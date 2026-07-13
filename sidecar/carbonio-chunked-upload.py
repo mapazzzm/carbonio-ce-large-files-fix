@@ -11,11 +11,15 @@ Parts can arrive in any order and concurrently — there is one asyncio.Lock per
 session so only one task finalises.
 """
 import asyncio
+import hmac
+import json
 import logging
 import os
 import re
 import shutil
+import struct
 import time
+import zlib
 from pathlib import Path
 
 import aiofiles
@@ -91,6 +95,136 @@ NODE_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-
 BLOBS_ROOT = Path("/opt/zextras/carbonio-storages/blobs")
 DB_NAME = "carbonio-files-db"   # postgres database (peer-auth as zextras)
 _db_pool = None
+# --------------------------------------------------------------------------
+
+# Public folder ZIP download (POST /services/files/public/download-multiple) ---
+# Carbonio's Java endpoint streams a ZIP by fetching each member blob from
+# storages over OkHttp — the same path that EOFs/OOMs on large blobs. On a
+# folder of several GB the ZIP is truncated (~512 KiB) and the browser saves
+# nothing. We rebuild the ZIP here: validate the public link + access code and
+# subtree membership against the DB, then stream a ZIP64 archive assembled
+# straight from the blobs on disk. Any size / file count is fine.
+# Public link ids are user-visible tokens (varchar); accept a permissive set.
+PUBLIC_LINK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,255}$")
+# Guard rails so a crafted request can't explode memory / walk forever.
+MAX_ZIP_SELECTED = 1000        # top-level nodeIds accepted in one request
+MAX_ZIP_ENTRIES = 100_000      # total files+dirs emitted into one archive
+ZIP_READ_BUF = 1024 * 1024     # blob read chunk while zipping
+# Strip path separators / control chars from a node name used as one path
+# component, so a name like "A / B" can't create phantom directories or escape.
+_ZIP_NAME_BAD_RE = re.compile(r"[/\\\r\n\x00]")
+
+
+def zip_component(name: str) -> str:
+    s = _ZIP_NAME_BAD_RE.sub("_", name or "").strip().strip(".")
+    return s or "unnamed"
+
+
+# ZIP64, store-only, data-descriptor streaming writer. No seeking, so the whole
+# archive can be produced as a forward-only byte stream of unbounded size.
+_LFH_SIG = 0x04034b50
+_DD_SIG = 0x08074b50
+_CDH_SIG = 0x02014b50
+_EOCD_SIG = 0x06054b50
+_Z64_EOCD_SIG = 0x06064b50
+_Z64_LOC_SIG = 0x07064b50
+_Z64_EXTRA = 0x0001
+_ZIP_FLAGS = 0x0808            # bit3 data-descriptor + bit11 UTF-8 names
+_ZIP_VERSION = 45             # 4.5 → ZIP64
+_U32 = 0xFFFFFFFF
+
+
+def _dos_datetime(ts: float) -> tuple[int, int]:
+    t = time.localtime(ts)
+    if t.tm_year < 1980:
+        return 0, 0x21
+    dt = ((t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)) & 0xFFFF
+    dd = (((t.tm_year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday) & 0xFFFF
+    return dt, dd
+
+
+async def stream_zip(entries, mtime=None):
+    """Yield a ZIP64 archive. `entries` is a list of dicts:
+        {"name": <arcname str>, "is_dir": bool, "path": Path|None}
+    Directories carry no data. Files are read from `path` in chunks; CRC and
+    size are computed on the fly and written in a trailing data descriptor.
+    """
+    if mtime is None:
+        mtime = time.time()
+    dt, dd = _dos_datetime(mtime)
+    pos = 0
+    cds = []
+    for e in entries:
+        name = e["name"]
+        is_dir = e["is_dir"]
+        if is_dir and not name.endswith("/"):
+            name += "/"
+        name_b = name.encode("utf-8")
+        offset = pos
+        lfh = struct.pack(
+            "<IHHHHHIIIHH",
+            _LFH_SIG, _ZIP_VERSION, _ZIP_FLAGS, 0, dt, dd, 0, 0, 0, len(name_b), 0,
+        ) + name_b
+        yield lfh
+        pos += len(lfh)
+        crc = 0
+        size = 0
+        if not is_dir:
+            async with aiofiles.open(e["path"], "rb") as f:
+                while True:
+                    buf = await f.read(ZIP_READ_BUF)
+                    if not buf:
+                        break
+                    crc = zlib.crc32(buf, crc)
+                    size += len(buf)
+                    yield buf
+                    pos += len(buf)
+        crc &= 0xFFFFFFFF
+        dd_rec = struct.pack("<IIQQ", _DD_SIG, crc, size, size)
+        yield dd_rec
+        pos += len(dd_rec)
+        cds.append((name_b, is_dir, crc, size, offset, dt, dd))
+
+    cd_start = pos
+    cd = bytearray()
+    for name_b, is_dir, crc, size, offset, edt, edd in cds:
+        z64 = b""
+        if size >= _U32:
+            z64 += struct.pack("<Q", size)   # uncompressed
+        if size >= _U32:
+            z64 += struct.pack("<Q", size)   # compressed (store)
+        if offset >= _U32:
+            z64 += struct.pack("<Q", offset)
+        extra = struct.pack("<HH", _Z64_EXTRA, len(z64)) + z64 if z64 else b""
+        size32 = _U32 if size >= _U32 else size
+        off32 = _U32 if offset >= _U32 else offset
+        ext_attr = (0o040755 << 16) if is_dir else (0o100644 << 16)
+        cd += struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            _CDH_SIG, (3 << 8) | _ZIP_VERSION, _ZIP_VERSION, _ZIP_FLAGS, 0,
+            edt, edd, crc, size32, size32, len(name_b), len(extra), 0, 0, 0,
+            ext_attr, off32,
+        ) + name_b + extra
+    yield bytes(cd)
+    pos += len(cd)
+    n = len(cds)
+    cd_size = len(cd)
+
+    z64_eocd_off = pos
+    z64_eocd = struct.pack(
+        "<IQHHIIQQQQ",
+        _Z64_EOCD_SIG, 44, (3 << 8) | _ZIP_VERSION, _ZIP_VERSION, 0, 0,
+        n, n, cd_size, cd_start,
+    )
+    yield z64_eocd
+    pos += len(z64_eocd)
+    yield struct.pack("<IIQI", _Z64_LOC_SIG, 0, z64_eocd_off, 1)
+    yield struct.pack(
+        "<IHHHHIIH",
+        _EOCD_SIG, 0, 0, min(n, 0xFFFF), min(n, 0xFFFF),
+        _U32 if cd_size >= _U32 else cd_size,
+        _U32 if cd_start >= _U32 else cd_start, 0,
+    )
 # --------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -618,6 +752,156 @@ async def handle_ui_download(request: web.Request) -> web.StreamResponse:
     )
 
 
+def _build_zip_entries(shared_folder, by_id, children, selected_ids):
+    """DFS from each selected node, producing zip entries with paths rooted at
+    the selected node's own name. Every node is guaranteed (by the caller) to
+    live inside the shared subtree, so paths never escape it."""
+    entries = []
+
+    def walk(node_id, prefix):
+        node = by_id[node_id]
+        comp = zip_component(node["name"])
+        path = f"{prefix}{comp}" if prefix else comp
+        if node["node_type"] == "FOLDER" or node["node_type"] == "ROOT":
+            entries.append({"name": path, "is_dir": True, "path": None})
+            for child in children.get(node_id, ()):
+                if len(entries) >= MAX_ZIP_ENTRIES:
+                    return
+                walk(child["node_id"], path + "/")
+        else:
+            version = node["current_version"]
+            if version is None:
+                return
+            blob = BLOBS_ROOT / node_id[:2] / f"{node_id}-{version}"
+            try:
+                if not str(blob.resolve()).startswith(str(BLOBS_ROOT.resolve()) + os.sep):
+                    return
+            except OSError:
+                return
+            if not blob.exists():
+                log.warning("zip: blob missing node=%s ver=%s", node_id, version)
+                return
+            entries.append({"name": path, "is_dir": False, "path": blob})
+
+    for nid in selected_ids:
+        if len(entries) >= MAX_ZIP_ENTRIES:
+            break
+        walk(nid, "")
+    return entries
+
+
+async def handle_public_download_multiple(request: web.Request) -> web.StreamResponse:
+    """Rebuild the folder ZIP that Java can't stream for large blobs.
+
+    The public-folder UI submits a hidden form (urlencoded) with nodeIds (a JSON
+    array), nodeLinkId and optional accessCode, targeting a sandboxed iframe, so
+    the response must carry Content-Disposition: attachment. We authorise
+    against the DB (link validity, access code, subtree membership) and stream a
+    ZIP assembled from blobs on disk.
+    """
+    try:
+        form = await request.post()
+    except Exception:
+        return web.json_response({"error": "bad form"}, status=400)
+    node_link_id = (form.get("nodeLinkId") or "").strip()
+    access_code = form.get("accessCode")
+    raw_ids = form.get("nodeIds") or "[]"
+    if not PUBLIC_LINK_ID_RE.match(node_link_id):
+        return web.json_response({"error": "bad link id"}, status=400)
+    try:
+        node_ids = json.loads(raw_ids)
+        if not isinstance(node_ids, list):
+            raise ValueError
+    except Exception:
+        return web.json_response({"error": "bad nodeIds"}, status=400)
+    # De-dup, validate shape, cap count.
+    seen = set()
+    node_ids = [x for x in node_ids
+                if isinstance(x, str) and NODE_UUID_RE.match(x)
+                and not (x in seen or seen.add(x))]
+    if not node_ids:
+        return web.json_response({"error": "no valid nodeIds"}, status=400)
+    if len(node_ids) > MAX_ZIP_SELECTED:
+        return web.json_response({"error": "too many nodes"}, status=413)
+
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            link = await conn.fetchrow(
+                "SELECT node_id, access_code, expire_at FROM link WHERE public_id = $1",
+                node_link_id,
+            )
+            if not link:
+                return web.json_response({"error": "link not found"}, status=404)
+            if link["expire_at"] and link["expire_at"] < int(time.time() * 1000):
+                return web.json_response({"error": "link expired"}, status=410)
+            # Access code is stored plaintext; compare in constant time.
+            stored_code = link["access_code"]
+            if stored_code:
+                if not access_code or not hmac.compare_digest(str(access_code), str(stored_code)):
+                    return web.json_response({"error": "wrong access code"}, status=403)
+            shared_folder = link["node_id"]
+
+            # Fetch the whole shared subtree once (folder itself + descendants).
+            rows = await conn.fetch(
+                """
+                SELECT node_id, name, node_type, folder_id, current_version, ancestor_ids
+                FROM node
+                WHERE node_id = $1
+                   OR $1 = ANY(string_to_array(ancestor_ids, ','))
+                """,
+                shared_folder,
+            )
+    except Exception as exc:
+        log.exception("zip: db lookup failed link=%s: %s", node_link_id[:8], exc)
+        return web.json_response({"error": "db error"}, status=502)
+
+    by_id = {r["node_id"]: dict(r) for r in rows}
+    # Subtree membership: every requested node must be inside the shared folder.
+    for nid in node_ids:
+        if nid not in by_id:
+            log.warning("zip: node %s not in shared subtree of link=%s",
+                        nid, node_link_id[:8])
+            return web.json_response({"error": "node not in share"}, status=403)
+
+    children: dict[str, list] = {}
+    for r in by_id.values():
+        children.setdefault(r["folder_id"], []).append(r)
+    for lst in children.values():
+        lst.sort(key=lambda x: (x["node_type"] != "FOLDER", (x["name"] or "").lower()))
+
+    entries = _build_zip_entries(shared_folder, by_id, children, node_ids)
+    file_count = sum(1 for e in entries if not e["is_dir"])
+    if file_count == 0:
+        return web.json_response({"error": "no downloadable files"}, status=404)
+
+    # ZIP name: the selected folder if exactly one, else the shared folder.
+    if len(node_ids) == 1:
+        zip_name = zip_component(by_id[node_ids[0]]["name"])
+    else:
+        zip_name = zip_component((by_id.get(shared_folder) or {}).get("name") or "download")
+
+    resp = web.StreamResponse(status=200)
+    resp.headers["Content-Type"] = "application/zip"
+    resp.headers["Content-Disposition"] = quote_filename_for_header(zip_name + ".zip")
+    resp.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    await resp.prepare(request)
+    log.info("zip: link=%s.. selected=%d files=%d entries=%d name=%s",
+             node_link_id[:8], len(node_ids), file_count, len(entries), zip_name)
+    try:
+        async for chunk in stream_zip(entries):
+            await resp.write(chunk)
+        await resp.write_eof()
+    except (ConnectionResetError, asyncio.CancelledError):
+        log.info("zip: client disconnected link=%s..", node_link_id[:8])
+    except Exception as exc:
+        # Headers already sent — can't switch to an error status; just log and
+        # drop the connection so the client sees a truncated (invalid) archive.
+        log.exception("zip: stream failed link=%s..: %s", node_link_id[:8], exc)
+    return resp
+
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
@@ -716,6 +1000,7 @@ def build_app() -> web.Application:
     app.router.add_get("/upload-chunked/status", handle_status)
     app.router.add_post("/upload-chunked/abort", handle_abort)
     app.router.add_get("/public-download/{token}", handle_public_download)
+    app.router.add_post("/public-download-multiple", handle_public_download_multiple)
     app.router.add_get("/ui-download/{node_id}/check", handle_ui_download_check)
     app.router.add_get("/ui-download/{node_id}", handle_ui_download)
     app.router.add_get("/health", handle_health)
