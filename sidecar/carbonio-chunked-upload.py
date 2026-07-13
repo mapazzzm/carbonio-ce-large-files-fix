@@ -893,8 +893,10 @@ async def handle_public_download_multiple(request: web.Request) -> web.StreamRes
         async for chunk in stream_zip(entries):
             await resp.write(chunk)
         await resp.write_eof()
-    except (ConnectionResetError, asyncio.CancelledError):
-        log.info("zip: client disconnected link=%s..", node_link_id[:8])
+    except (ConnectionError, asyncio.CancelledError) as exc:
+        # ConnectionError covers both ConnectionResetError and aiohttp's
+        # "Connection lost" — a normal client/proxy disconnect, not an error.
+        log.info("zip: client disconnected link=%s.. (%s)", node_link_id[:8], exc)
     except Exception as exc:
         # Headers already sent — can't switch to an error status; just log and
         # drop the connection so the client sees a truncated (invalid) archive.
