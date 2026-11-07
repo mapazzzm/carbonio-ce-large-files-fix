@@ -11,14 +11,34 @@ in Java returns EOFException (storages closes idle TCP). verifyBlobExists
 swallows it as `return false`, and uploadFile then throws DependencyException
 "Upload verification failed: blob not accessible". Patch bypasses the throw.
 
-Applies to: carbonio-files-ce 1.1.x and 1.2.x. The constant-pool index of the
-verifyBlobExists Methodref differs between builds (#403 in 1.1.2, #399 in
-1.2.4), so it is resolved dynamically from the class constant pool instead of
-being hard-coded. Single byte change at 2 sites: opcode 0x9A → 0x9C.
+Applies to: carbonio-files-ce 1.1.x, 1.2.x and 2.x. The constant-pool index of
+the verifyBlobExists Methodref differs between builds (#403 in 1.1.2, #399 in
+1.2.4, #413 in 2.1.4), so it is resolved dynamically from the class constant
+pool instead of being hard-coded. Single byte change at 2 sites: opcode
+0x9A → 0x9C.
+
+The JAR was renamed in 2.x (carbonio-files.jar → carbonio-files-ce.jar); the
+path is detected automatically. Override with CU_FILES_JAR=/path/to.jar.
 """
 import zipfile, os, shutil, struct, sys, time
 
-JAR = "/usr/share/carbonio/carbonio-files.jar"
+JAR_CANDIDATES = (
+    "/usr/share/carbonio/carbonio-files-ce.jar",   # files-ce 2.x
+    "/usr/share/carbonio/carbonio-files.jar",      # files-ce 1.1.x–1.2.x
+)
+
+
+def _detect_jar() -> str:
+    override = os.environ.get("CU_FILES_JAR")
+    if override:
+        return override
+    for path in JAR_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return JAR_CANDIDATES[0]
+
+
+JAR = _detect_jar()
 CLASS_PATH = "com/zextras/carbonio/files/rest/services/BlobService.class"
 METHOD = b"verifyBlobExists"
 
@@ -76,6 +96,10 @@ def is_patched() -> bool:
 
 
 def main():
+    if "--print-jar" in sys.argv:
+        # install.sh / uninstall.sh use this to back up / restore the right file.
+        print(JAR)
+        return
     if not os.path.exists(JAR):
         sys.exit(f"JAR not found: {JAR}")
     if "--check" in sys.argv:
@@ -86,7 +110,7 @@ def main():
         bak = f"/root/backups/carbonio-files/{time.strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(bak, exist_ok=True)
         shutil.copy2(JAR, bak)
-        print(f"Backup: {bak}/carbonio-files.jar")
+        print(f"Backup: {bak}/{os.path.basename(JAR)}")
 
     with zipfile.ZipFile(JAR, "r") as z:
         bs = bytearray(z.read(CLASS_PATH))
@@ -117,6 +141,7 @@ def main():
         for item in zin.infolist():
             data = bytes(bs) if item.filename == CLASS_PATH else zin.read(item.filename)
             zout.writestr(item, data)
+    shutil.copymode(JAR, new)
     os.replace(new, JAR)
     print(f"JAR repacked. Restart: systemctl restart carbonio-files")
 

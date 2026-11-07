@@ -45,10 +45,32 @@ need_pkg() {
   msg "  $pkg: $got (ожидается $expected)" "  $pkg: $got (expected $expected)"
 }
 msg "[0/8] Проверка версий пакетов:" "[0/8] Version check:"
-need_pkg carbonio-files-ce       "1.1.x–1.2.x (CE 26.x)"
-need_pkg carbonio-storages-ce    "1.0.x"
+need_pkg carbonio-files-ce       "1.1.x–2.1.x (CE 26.x)"
+need_pkg carbonio-storages-ce    "1.0.x–1.1.x"
 need_pkg carbonio-files-ui       "2.15.x–2.17.x (CE 26.x)"
 echo
+
+# Active hash directory of an iris UI package. After an apt upgrade old hash
+# dirs stay next to the new one, so "first dir in ls" may be stale — take the
+# one components.json points at; fall back to the newest dir.
+active_ui_dir() {
+  local pkg=$1 d
+  d=$(python3 -I -c 'import json, sys
+try:
+    data = json.load(open("/opt/zextras/web/iris/components.json"))
+    comps = data.get("components", data) if isinstance(data, dict) else data
+    for c in comps:
+        if isinstance(c, dict) and c.get("name") == sys.argv[1]:
+            print(c.get("js_entrypoint", "").split("/")[4])
+            break
+except Exception:
+    pass' "$pkg" 2>/dev/null || true)
+  if [ -n "$d" ] && [ -d "/opt/zextras/web/iris/$pkg/$d" ]; then
+    echo "/opt/zextras/web/iris/$pkg/$d/"
+    return
+  fi
+  ls -dt /opt/zextras/web/iris/"$pkg"/*/ 2>/dev/null | grep -vE '/(current|i18n)/$' | head -1 || true
+}
 
 # --- 1. Python deps -------------------------------------------------------
 msg "[1/8] Python-зависимости (aiohttp, aiofiles, asyncpg)..." \
@@ -73,8 +95,10 @@ msg "[3/8] JAR-патч (BlobService.verifyBlobExists, ifne→ifge)..." \
     "[3/8] JAR patch (BlobService verifyBlobExists, ifne→ifge)..."
 # Back up only a vanilla JAR — otherwise a second install run would store an
 # already-patched JAR as the "backup" and uninstall could never revert.
+# The JAR was renamed in files-ce 2.x; the patch script detects the path.
+FILES_JAR=$(python3 "$HERE/patches/blobservice_patch.py" --print-jar)
 if ! python3 "$HERE/patches/blobservice_patch.py" --check; then
-  cp -a /usr/share/carbonio/carbonio-files.jar "$BAK/"
+  cp -a "$FILES_JAR" "$BAK/"
 fi
 python3 "$HERE/patches/blobservice_patch.py"
 msg "  готово" "  ok"
@@ -105,6 +129,26 @@ elif grep -q -- '-Xmx4096m' /usr/lib/systemd/system/carbonio-files.service 2>/de
   rm -f /tmp/cu_heap_execstart.$$
   systemctl daemon-reload
   msg "  готово (systemd drop-in heap.conf)" "  ok (systemd drop-in heap.conf)"
+elif [ -f /usr/bin/carbonio-files ] \
+     && ! grep -q -- '-Xmx' /usr/bin/carbonio-files \
+     && ! grep -qs -- '-Xmx' /usr/lib/systemd/system/carbonio-files.service; then
+  # files-ce 2.x: the unit is Type=notify and runs the /usr/bin/carbonio-files
+  # wrapper (exec java ... -jar carbonio-files-ce.jar) with no -Xmx at all.
+  # Pass the heap via JAVA_TOOL_OPTIONS instead of overriding ExecStart: it
+  # survives JAR renames and keeps the vendor launch path. A drop-in left over
+  # from 1.2.x (ExecStart= pointing at the old carbonio-files.jar) breaks the
+  # service on 2.x, so it is replaced here (self-healing on re-run).
+  HEAP_DROPIN=/etc/systemd/system/carbonio-files.service.d/heap.conf
+  if grep -qs 'JAVA_TOOL_OPTIONS=.*-Xmx8192m' "$HEAP_DROPIN" && ! grep -qs '^ExecStart=' "$HEAP_DROPIN"; then
+    msg "  heap уже настроен (JAVA_TOOL_OPTIONS) — пропускаю" "  heap already tuned (JAVA_TOOL_OPTIONS) - skipping"
+  else
+    mkdir -p "$(dirname "$HEAP_DROPIN")"
+    [ -f "$HEAP_DROPIN" ] && cp -a "$HEAP_DROPIN" "$BAK/heap.conf"
+    printf '%s\n' '# carbonio-ce-large-files-fix: Java heap for carbonio-files (files-ce 2.x)' \
+      '[Service]' 'Environment="JAVA_TOOL_OPTIONS=-Xms2048m -Xmx8192m"' > "$HEAP_DROPIN"
+    systemctl daemon-reload
+    msg "  готово (drop-in heap.conf, JAVA_TOOL_OPTIONS)" "  ok (drop-in heap.conf, JAVA_TOOL_OPTIONS)"
+  fi
 else
   msg "  heap уже настроен — пропускаю" "  heap already tuned - skipping"
 fi
@@ -179,7 +223,15 @@ PYEOF
 done
 su - zextras -c "/opt/zextras/libexec/zmproxyconfgen" >/dev/null 2>&1
 su - zextras -c "/opt/zextras/common/sbin/nginx -t -c /opt/zextras/conf/nginx.conf" 2>&1 | tail -2
-kill -HUP "$(cat /run/carbonio/nginx.pid)"
+# CE 26.9+ (proxy 4.14.x): nginx is the systemd unit carbonio-nginx, and a HUP
+# does not pick up the regenerated config — restart it. The unit's ExecStartPre
+# chowns the client temp dir as zextras, so fix its owner first.
+chown zextras:zextras /opt/zextras/data/tmp/nginx/client
+if systemctl cat carbonio-nginx.service >/dev/null 2>&1; then
+  systemctl restart carbonio-nginx
+else
+  kill -HUP "$(cat /run/carbonio/nginx.pid)"
+fi
 sleep 1
 chown zextras:zextras /opt/zextras/data/tmp/nginx/client
 msg "  готово" "  ok"
@@ -187,7 +239,7 @@ msg "  готово" "  ok"
 # --- 7. JS patches (files-ui + shell-ui + mails-ui) -----------------------
 msg "[7/8] JS-патчи (files-ui + shell-ui + mails-ui)..." \
     "[7/8] JS patches (files-ui + shell-ui + mails-ui)..."
-UI_BASE=$(ls -d /opt/zextras/web/iris/carbonio-files-ui/*/ 2>/dev/null | grep -v i18n | grep -v current | head -1)
+UI_BASE=$(active_ui_dir carbonio-files-ui)
 # files-ui 2.15.x ships the UploadStore in 659.*.chunk.js; 2.17.x moved it
 # into the main app.*.js bundle. Locate the file by content, not by name.
 # `|| true` guards: with pipefail a no-match grep/ls would silently kill the
@@ -231,8 +283,8 @@ else
 fi
 
 # 7b. shell-ui PostHog warn suppression (Carbonio architectural noise)
-SHELL_BASE=$(ls -d /opt/zextras/web/iris/carbonio-shell-ui/*/ 2>/dev/null | grep -v current | head -1)
-SHELL_CHUNK=$(grep -l 'PostHog.js.*already loaded elsewhere' "$SHELL_BASE"*.chunk.js 2>/dev/null | head -1)
+SHELL_BASE=$(active_ui_dir carbonio-shell-ui)
+SHELL_CHUNK=$(grep -l 'PostHog.js.*already loaded elsewhere' "$SHELL_BASE"*.chunk.js 2>/dev/null | grep -v '\.map' | head -1 || true)
 if [ -n "$SHELL_CHUNK" ]; then
   cp -a "$SHELL_CHUNK" "$BAK/"
   python3 - "$SHELL_CHUNK" <<'PYEOF'
@@ -254,8 +306,8 @@ else
 fi
 
 # 7c. mails-ui mails-edit-view.*.chunk.js (smart-link mail attach via fetch)
-MAILS_BASE=$(ls -d /opt/zextras/web/iris/carbonio-mails-ui/*/ 2>/dev/null | grep -v i18n | grep -v current | head -1)
-MAILS_EV=$(ls "${MAILS_BASE}mails-edit-view."*.chunk.js 2>/dev/null | grep -v '\.bak\.' | grep -v '\.map' | head -1)
+MAILS_BASE=$(active_ui_dir carbonio-mails-ui)
+MAILS_EV=$(ls "${MAILS_BASE}mails-edit-view."*.chunk.js 2>/dev/null | grep -v '\.bak\.' | grep -v '\.map' | head -1 || true)
 if [ -z "$MAILS_EV" ]; then
   msg "  ПРЕДУПРЕЖДЕНИЕ: mails-edit-view.*.chunk.js не найден в $MAILS_BASE — пропускаю mail-attach патч" \
       "  WARNING: mails-edit-view.*.chunk.js not found in $MAILS_BASE - skipping mail-attach patch" >&2

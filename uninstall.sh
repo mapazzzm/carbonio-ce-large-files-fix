@@ -28,16 +28,24 @@ if [ -z "$BAK" ]; then
 fi
 msg "Восстановление из: $BAK" "Restoring from: $BAK"
 
-# 1. JAR
-if [ -f "$BAK/carbonio-files.jar" ]; then
-  cp -a "$BAK/carbonio-files.jar" /usr/share/carbonio/carbonio-files.jar
-  msg "  JAR восстановлен" "  JAR restored"
-fi
+# 1. JAR (renamed in files-ce 2.x: carbonio-files.jar → carbonio-files-ce.jar)
+for j in carbonio-files-ce.jar carbonio-files.jar; do
+  if [ -f "$BAK/$j" ] && [ -f "/usr/share/carbonio/$j" ]; then
+    cp -a "$BAK/$j" "/usr/share/carbonio/$j"
+    msg "  JAR восстановлен ($j)" "  JAR restored ($j)"
+  fi
+done
 
 # 2. Java wrapper (heap)
 if [ -f "$BAK/carbonio-files.wrapper" ]; then
   cp -a "$BAK/carbonio-files.wrapper" /usr/bin/carbonio-files
   msg "  /usr/bin/carbonio-files восстановлен" "  /usr/bin/carbonio-files restored"
+fi
+# 2b. systemd heap drop-in (files-ce 1.2.x ExecStart override / 2.x JAVA_TOOL_OPTIONS)
+if [ -f /etc/systemd/system/carbonio-files.service.d/heap.conf ]; then
+  rm -f /etc/systemd/system/carbonio-files.service.d/heap.conf
+  systemctl daemon-reload
+  msg "  drop-in heap.conf удалён" "  drop-in heap.conf removed"
 fi
 
 # 3. nginx templates
@@ -48,7 +56,13 @@ for t in nginx.conf.web.https.template nginx.conf.web.https.default.template; do
   fi
 done
 su - zextras -c "/opt/zextras/libexec/zmproxyconfgen" >/dev/null 2>&1
-kill -HUP "$(cat /run/carbonio/nginx.pid)"
+# CE 26.9+: systemd unit carbonio-nginx, HUP does not reload templates — restart.
+chown zextras:zextras /opt/zextras/data/tmp/nginx/client
+if systemctl cat carbonio-nginx.service >/dev/null 2>&1; then
+  systemctl restart carbonio-nginx
+else
+  kill -HUP "$(cat /run/carbonio/nginx.pid)"
+fi
 sleep 1
 chown zextras:zextras /opt/zextras/data/tmp/nginx/client
 

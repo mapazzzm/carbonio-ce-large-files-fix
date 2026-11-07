@@ -8,7 +8,7 @@
 
 Набор патчей, превращающий **Carbonio Community Edition** в почтовый сервер, который умеет работать с файлами **произвольного** размера в Carbonio Files (upload, download, public-link, smart-link в письмах).
 
-Протестировано на `carbonio-files-ce 1.1.2` + `carbonio-storages-ce 1.0.16` (Carbonio CE 26.x на Ubuntu Noble). Проверено на файлах больше 7 ГБ.
+Протестировано на `carbonio-files-ce 1.1.2` + `carbonio-storages-ce 1.0.16` (CE 26.3), `carbonio-files-ce 1.2.4` (CE 26.6) и `carbonio-files-ce 2.1.4` + `carbonio-storages-ce 1.1.0` (CE 26.9), Ubuntu Noble. В files-ce 2.x JAR переименован в `carbonio-files-ce.jar`, а heap задаётся через `JAVA_TOOL_OPTIONS` — `install.sh` определяет это сам; повторный запуск поверх старой установки обновляет её. Проверено на файлах больше 7 ГБ.
 
 ### Что чинит
 
@@ -138,7 +138,7 @@ AGPL-3.0.
 
 A bundle of patches that makes **Carbonio Community Edition** handle files of arbitrary size in Carbonio Files (upload, download, public-link, smart-link in mail).
 
-Tested against `carbonio-files-ce 1.1.2` + `carbonio-storages-ce 1.0.16` (Carbonio CE 26.x on Ubuntu Noble). Verified on files larger than 7 GB.
+Tested against `carbonio-files-ce 1.1.2` + `carbonio-storages-ce 1.0.16` (CE 26.3), `carbonio-files-ce 1.2.4` (CE 26.6) and `carbonio-files-ce 2.1.4` + `carbonio-storages-ce 1.1.0` (CE 26.9), Ubuntu Noble. In files-ce 2.x the JAR is renamed to `carbonio-files-ce.jar` and the heap is set via `JAVA_TOOL_OPTIONS` — `install.sh` detects this; re-running it over an older install upgrades it in place. Verified on files larger than 7 GB.
 
 ### What it fixes
 
